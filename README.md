@@ -149,6 +149,89 @@ effect. Failures are pseudorandom using a seed, key, and persisted request count
 before failure injection. `CHARGE_TOOL_RESPONSE_DELAY_SECONDS` delays responses after commit,
 creating a genuine ambiguous-outcome window.
 
+### Manual retry-exhaustion restart test
+
+This verifies that a known retryable failure becomes terminal after its failure budget is exhausted,
+and that a worker restart does not revive the workflow even after the tool becomes healthy.
+
+Start from a clean stack:
+
+```sh
+docker compose down -v
+docker compose up --build -d --wait db api
+```
+
+Start a reachable tool that deliberately fails requests before creating any effect:
+
+```sh
+CHARGE_TOOL_FAIL_FIRST=100 \
+CHARGE_TOOL_RETRY_AFTER_SECONDS=0 \
+CHARGE_TOOL_FAILURE_RATE=0 \
+docker compose up --build -d tool
+```
+
+Start the worker with a one-failure budget. `--no-deps` prevents Compose from recreating the tool
+with default settings:
+
+```sh
+CHARGE_MAX_FAILURES=1 \
+docker compose up --build -d --no-deps worker
+```
+
+Submit a run and copy the returned run ID:
+
+```sh
+curl -s -X POST http://localhost:8000/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"retry-exhaustion-test","amount_cents":2500,"currency":"USD"}'
+```
+
+Inspect the run and tool ledger:
+
+```sh
+curl -s http://localhost:8000/runs/<RUN_ID>
+curl -s "http://localhost:8001/effects?prefix=<RUN_ID>"
+```
+
+Expected state before restart:
+
+- run is `failed`
+- `charge` is `failed` with `attempts=1` and `failures=1`
+- `provision` and `notify` remain `pending`
+- the effects endpoint returns `[]`
+
+The tool service itself is still healthy and reachable; only the configured requests are failing:
+
+```sh
+curl -s http://localhost:8001/health
+docker compose logs --no-color worker
+```
+
+Kill the worker, make the tool healthy, and restart the worker:
+
+```sh
+docker compose kill -s SIGKILL worker
+
+CHARGE_TOOL_FAIL_FIRST=0 \
+CHARGE_TOOL_FAILURE_RATE=0 \
+docker compose up -d --force-recreate tool
+
+CHARGE_MAX_FAILURES=1 \
+docker compose up -d --no-deps --force-recreate worker
+```
+
+Inspect the same run and ledger again:
+
+```sh
+curl -s http://localhost:8000/runs/<RUN_ID>
+curl -s "http://localhost:8001/effects?prefix=<RUN_ID>"
+docker compose logs --no-color worker
+```
+
+Expected result: the run remains `failed`, charge remains at one attempt and one failure, later
+steps remain pending, no effects are created, and the restarted worker does not select the terminal
+workflow. This demonstrates that retry exhaustion is durable across process restarts.
+
 ## Failure modes
 
 | Death point | Durable state | Recovery and reason |
