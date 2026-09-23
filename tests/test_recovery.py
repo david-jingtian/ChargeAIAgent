@@ -10,7 +10,6 @@ from charge_agent.models import State, WorkflowInput
 from charge_agent.storage import Store
 from charge_agent.tool_storage import ToolStore
 
-
 STEPS = ("charge", "provision", "notify")
 
 
