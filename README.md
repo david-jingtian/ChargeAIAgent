@@ -110,6 +110,70 @@ Completed keys return their saved result before failure injection.
 | Inside checkpoint transaction | Completion writes uncommitted | PostgreSQL rolls back; replay safely. If COMMIT succeeded but its acknowledgement was lost, skip the saved completion. |
 | After checkpoint commit | Step completed | Skip it; advance. Final-step/run completion is atomic. |
 
+### Manual non-charge crash recovery
+
+To verify recovery on a later workflow step, pause after `provision` returns but before its
+completion is checkpointed:
+
+```sh
+docker compose down -v
+docker compose up --build -d --wait db tool api
+
+CHARGE_PAUSE_AT=after_tool \
+CHARGE_PAUSE_STEP=provision \
+CHARGE_TOOL_FAILURE_RATE=0 \
+docker compose up --build -d worker
+```
+
+Submit a run and copy the returned run ID:
+
+```sh
+curl -s -X POST http://localhost:8000/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"customer_id":"manual-crash-test","amount_cents":2500,"currency":"USD"}'
+```
+
+Confirm the worker paused on `provision`:
+
+```sh
+docker compose logs --no-color worker
+curl -s http://localhost:8000/runs/<RUN_ID>
+curl -s "http://localhost:8001/effects?prefix=<RUN_ID>"
+```
+
+Expected pre-crash state:
+
+- `charge` is `completed`
+- `provision` is `running`
+- `notify` is `pending`
+- the tool ledger already contains one charge effect and one provision effect
+
+Kill the worker with SIGKILL, then restart it without the pause:
+
+```sh
+docker compose kill -s SIGKILL worker
+
+CHARGE_PAUSE_AT= \
+CHARGE_TOOL_FAILURE_RATE=0 \
+docker compose up -d --force-recreate worker
+```
+
+Inspect the same run again:
+
+```sh
+curl -s http://localhost:8000/runs/<RUN_ID>
+curl -s "http://localhost:8001/effects?prefix=<RUN_ID>"
+```
+
+Expected final state:
+
+- the run and all three steps are `completed`
+- attempts are `charge=1`, `provision=2`, `notify=1`
+- the ledger contains exactly one charge, one provision, and one notify effect
+
+This demonstrates the key guarantee: `provision` may be attempted twice after a crash, but the
+durable external effect is created only once because the same idempotency key is reused.
+
 ## Tests and development
 
 ```sh
