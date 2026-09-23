@@ -1,4 +1,5 @@
 import signal
+import time
 from uuid import UUID
 
 import httpx
@@ -139,6 +140,55 @@ def test_restart_preserves_retry_wait(database: Connection, processes: Processes
     assert run is not None
     assert [step.attempts for step in run.steps] == [2, 2, 2]
     assert [step.failures for step in run.steps] == [1, 1, 1]
+
+
+def test_retry_exhaustion_stays_terminal_after_restart(
+    database: Connection, processes: Processes
+) -> None:
+    failing_url = processes.service(
+        "charge_agent.mock_api:app",
+        {"CHARGE_TOOL_FAIL_FIRST": "100", "CHARGE_TOOL_RETRY_AFTER_SECONDS": "0"},
+    )
+    store = Store(database)
+    run_id = store.create_run(WorkflowInput())
+    worker, _ = processes.worker(failing_url, CHARGE_MAX_FAILURES="1")
+
+    def failed() -> bool:
+        run = store.get_run(run_id)
+        return run is not None and run.state == State.FAILED
+
+    wait_until(failed)
+    before = store.get_run(run_id)
+    assert before is not None
+    assert before.steps[0].state == State.FAILED
+    assert before.steps[0].attempts == 1
+    assert before.steps[0].failures == 1
+    assert all(step.state == State.PENDING for step in before.steps[1:])
+    assert ToolStore(database).effects(str(run_id)) == []
+    assert store.next_step() is None
+
+    worker.kill()
+    assert worker.wait(timeout=5) == -signal.SIGKILL
+
+    # Restart against a healthy tool. If terminal state were accidentally resurrected,
+    # the workflow would now make progress and create effects.
+    healthy_url = processes.service("charge_agent.mock_api:app")
+    restarted, log = processes.worker(healthy_url, CHARGE_MAX_FAILURES="1")
+    wait_until(lambda: "worker_ready" in log.read_text())
+
+    # Give the restarted worker several poll cycles to prove it does not select terminal work.
+    time.sleep(0.2)
+    assert restarted.poll() is None
+
+    after = store.get_run(run_id)
+    assert after is not None
+    assert after.state == State.FAILED
+    assert after.steps[0].state == State.FAILED
+    assert after.steps[0].attempts == 1
+    assert after.steps[0].failures == 1
+    assert all(step.state == State.PENDING for step in after.steps[1:])
+    assert ToolStore(database).effects(str(run_id)) == []
+    assert store.next_step() is None
 
 
 def test_second_worker_exits(database: Connection, processes: Processes) -> None:

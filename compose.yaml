@@ -48,12 +48,14 @@ services:
       CHARGE_TOOL_FAILURE_RATE: ${CHARGE_TOOL_FAILURE_RATE:-0.25}
       CHARGE_TOOL_FAIL_FIRST: ${CHARGE_TOOL_FAIL_FIRST:-0}
       CHARGE_TOOL_RESPONSE_DELAY_SECONDS: ${CHARGE_TOOL_RESPONSE_DELAY_SECONDS:-0}
+      CHARGE_TOOL_RETRY_AFTER_SECONDS: ${CHARGE_TOOL_RETRY_AFTER_SECONDS:-1}
   worker:
     <<: *app
     command: ["python", "-m", "charge_agent.worker"]
     environment:
       <<: *env
       CHARGE_TOOL_URL: http://tool:8001
+      CHARGE_MAX_FAILURES: ${CHARGE_MAX_FAILURES:-5}
       CHARGE_PAUSE_AT: ${CHARGE_PAUSE_AT:-}
       CHARGE_PAUSE_STEP: ${CHARGE_PAUSE_STEP:-charge}
     depends_on:
