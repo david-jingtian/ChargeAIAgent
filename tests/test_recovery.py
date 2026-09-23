@@ -10,6 +10,8 @@ from charge_agent.models import State, WorkflowInput
 from charge_agent.storage import Store
 from charge_agent.tool_storage import ToolStore
 
+STEPS = ("charge", "provision", "notify")
+
 
 def finished(store: Store, run_id: UUID) -> bool:
     run = store.get_run(run_id)
@@ -17,51 +19,97 @@ def finished(store: Store, run_id: UUID) -> bool:
     return run.state == State.COMPLETED
 
 
+@pytest.mark.parametrize("step_name", STEPS)
 @pytest.mark.parametrize("point", ["before_tool", "after_tool", "during_commit", "after_commit"])
 def test_sigkill_at_checkpoint_boundaries(
-    database: Connection, processes: Processes, point: str
+    database: Connection, processes: Processes, point: str, step_name: str
 ) -> None:
     url = processes.service("charge_agent.mock_api:app")
     store = Store(database)
     run_id = store.create_run(WorkflowInput())
-    worker, log = processes.worker(url, point)
+    worker, log = processes.worker(url, point, CHARGE_PAUSE_STEP=step_name)
     wait_until(lambda: '"event": "paused"' in log.read_text())
     worker.kill()  # Real SIGKILL: no finally blocks or graceful shutdown.
     assert worker.wait(timeout=5) == -signal.SIGKILL
+
+    paused = store.get_run(run_id)
+    assert paused is not None
+    target_index = STEPS.index(step_name)
+    target = paused.steps[target_index]
+
+    # Earlier steps must already be durable; later steps must not have started.
+    assert all(step.state == State.COMPLETED for step in paused.steps[:target_index])
+    assert all(step.state == State.PENDING for step in paused.steps[target_index + 1 :])
+    if point == "after_commit":
+        assert target.state == State.COMPLETED
+    else:
+        assert target.state == State.RUNNING
+
     processes.worker(url)
     wait_until(lambda: finished(store, run_id))
+
     effects = ToolStore(database).effects(str(run_id))
     assert len(effects) == 3
-    assert len({effect.result.operation for effect in effects}) == 3
+    assert {effect.result.operation.value for effect in effects} == set(STEPS)
+
     run = store.get_run(run_id)
     assert run is not None
-    assert run.steps[0].attempts == (1 if point == "after_commit" else 2)
     assert all(step.state == State.COMPLETED for step in run.steps)
-    if point != "before_tool":
-        charge_count = database.execute(
-            "SELECT count FROM mock_tool.requests WHERE idempotency_key = %s",
-            (run.steps[0].idempotency_key,),
-        ).fetchone()
-        assert charge_count is not None
-        assert charge_count["count"] == (1 if point == "after_commit" else 2)
+
+    expected_attempts = [1, 1, 1]
+    if point != "after_commit":
+        expected_attempts[target_index] = 2
+    assert [step.attempts for step in run.steps] == expected_attempts
+
+    target_requests = database.execute(
+        "SELECT count FROM mock_tool.requests WHERE idempotency_key = %s",
+        (run.steps[target_index].idempotency_key,),
+    ).fetchone()
+    assert target_requests is not None
+    expected_requests = 1 if point in {"before_tool", "after_commit"} else 2
+    assert target_requests["count"] == expected_requests
 
 
-def test_sigkill_after_effect_before_response(database: Connection, processes: Processes) -> None:
+@pytest.mark.parametrize("step_name", STEPS)
+def test_sigkill_after_effect_before_response(
+    database: Connection, processes: Processes, step_name: str
+) -> None:
     url = processes.service(
         "charge_agent.mock_api:app", {"CHARGE_TOOL_RESPONSE_DELAY_SECONDS": "1"}
     )
     store = Store(database)
     run_id = store.create_run(WorkflowInput())
     worker, _ = processes.worker(url)
-    wait_until(lambda: len(ToolStore(database).effects(str(run_id))) == 1)
+    target_index = STEPS.index(step_name)
+
+    # The ledger insert happens before the mock HTTP response delay. Seeing N effects means
+    # the target effect is durable while the worker is still waiting for that response.
+    wait_until(lambda: len(ToolStore(database).effects(str(run_id))) == target_index + 1)
+    before = store.get_run(run_id)
+    assert before is not None
+    assert before.steps[target_index].state == State.RUNNING
+
     worker.kill()
-    worker.wait(timeout=5)
+    assert worker.wait(timeout=5) == -signal.SIGKILL
     processes.worker(url)
     wait_until(lambda: finished(store, run_id))
-    assert len(ToolStore(database).effects(str(run_id))) == 3
+
+    effects = ToolStore(database).effects(str(run_id))
+    assert len(effects) == 3
+    assert {effect.result.operation.value for effect in effects} == set(STEPS)
+
     run = store.get_run(run_id)
     assert run is not None
-    assert run.steps[0].attempts == 2
+    expected_attempts = [1, 1, 1]
+    expected_attempts[target_index] = 2
+    assert [step.attempts for step in run.steps] == expected_attempts
+
+    target_requests = database.execute(
+        "SELECT count FROM mock_tool.requests WHERE idempotency_key = %s",
+        (run.steps[target_index].idempotency_key,),
+    ).fetchone()
+    assert target_requests is not None
+    assert target_requests["count"] == 2
 
 
 def test_restart_preserves_retry_wait(database: Connection, processes: Processes) -> None:

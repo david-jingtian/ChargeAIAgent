@@ -55,6 +55,7 @@ services:
       <<: *env
       CHARGE_TOOL_URL: http://tool:8001
       CHARGE_PAUSE_AT: ${CHARGE_PAUSE_AT:-}
+      CHARGE_PAUSE_STEP: ${CHARGE_PAUSE_STEP:-charge}
     depends_on:
       db:
         condition: service_healthy
