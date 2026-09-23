@@ -37,6 +37,31 @@ PostgreSQL data lives in a named volume: `docker compose down` preserves it;
 **`docker compose down -v` deletes it**. Services use local-demo credentials and no API
 authentication; this is not a production deployment.
 
+## Inspect the database
+
+From the project folder, connect to PostgreSQL in the running database container:
+
+```sh
+docker compose exec db psql -U charge -d charge
+```
+
+Then run these read-only queries:
+
+```sql
+SELECT id, state FROM engine.runs;
+
+SELECT run_id, position, name, state, attempts, failures, next_attempt_at
+FROM engine.steps
+ORDER BY run_id, position;
+
+SELECT * FROM mock_tool.effects;
+```
+
+Each run has its own charge/provision/notify rows; repeated step names across different
+`run_id` values are expected. To inspect one run, add `WHERE run_id = 'RUN_UUID'`
+before the steps query's `ORDER BY`. The effects table records actual mock side effects,
+while `attempts` counts engine attempts. Exit psql with `\q`.
+
 ## Execution and guarantees
 
 One worker executes ordered steps. A PostgreSQL session advisory lock rejects a second worker;
