@@ -103,14 +103,26 @@ share a transaction. Run creation and all step rows also share a transaction.
 
 ```mermaid
 stateDiagram-v2
-    pending --> running: start attempt
-    running --> completed: commit result
-    running --> retry_wait: transient error
-    retry_wait --> running: persisted deadline reached
-    running --> running: restart with same key
-    running --> failed: known failure / exhausted retries
-    running --> needs_review: unresolved outcome / stop retrying
+    pending --> running: start
+    running --> completed: saved
+    running --> retry_wait: retry
+    retry_wait --> running: due
+    running --> running: recover
+    running --> failed: known
+    running --> needs_review: unknown
 ```
+
+Arrow labels are kept short for readability:
+
+| Label | Meaning |
+|---|---|
+| start | Persist the start of an attempt before calling the tool. |
+| saved | Atomically commit the validated result and completed state. |
+| retry | A retryable error occurs and the failure budget allows another attempt; persist the retry deadline. |
+| due | The persisted retry deadline has been reached; the step is eligible for another attempt. |
+| recover | After a worker restart, retry the interrupted step with the same idempotency key. |
+| known | Retrying stops because of a permanent error or exhausted budget, with no unresolved outcome. |
+| unknown | Retrying stops while the outcome remains unresolved; record `needs_review`. |
 
 A running step after restart is an **unknown outcome**, never evidence that nothing happened.
 Each key is derived from run UUID, persisted workflow version, position, and name, and stored with
