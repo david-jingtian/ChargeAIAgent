@@ -79,7 +79,7 @@ Database loss, failover, and expired idempotency keys are outside the process-cr
   and can exceed that cap. Deadlines and failure counts persist across restart.
 - Default budget: **five recorded failures per step**, normally the initial failure plus four retries.
   Crashes increment attempts but do not consume the recorded-failure budget.
-  `CHARGE_MAX_FAILURES` configures the application; Compose does not forward it from the host.
+  `CHARGE_MAX_FAILURES` configures the application and is forwarded by Compose.
 - Timeouts, interrupted attempts, and other ambiguous responses leave uncertainty until success.
   A later 429 cannot erase it.
 
@@ -193,22 +193,43 @@ workflow. This demonstrates that retry exhaustion is durable across process rest
 | Inside checkpoint transaction | Completion writes uncommitted | PostgreSQL rolls back; replay safely. If COMMIT succeeded but its acknowledgement was lost, skip the saved completion. |
 | After checkpoint commit | Step completed | Skip it; advance. Final-step/run completion is atomic. |
 
-### Manual non-charge crash recovery
+### Manual crash matrix
 
-To verify recovery on a later workflow step, pause after `provision` returns but before its
-completion is checkpointed:
+The worker exposes two controls for deterministic crash testing:
+
+- `CHARGE_PAUSE_STEP`: `charge`, `provision`, or `notify`
+- `CHARGE_PAUSE_AT`: `before_tool`, `after_tool`, `during_commit`, or `after_commit`
+
+Together they cover all **12 stage/boundary combinations** used by the automated SIGKILL tests.
+
+| Pause point | What has happened when paused | Expected recovery after SIGKILL |
+|---|---|---|
+| `before_tool` | Step is durable as `running`; tool request has not been sent. | Same step is attempted again; tool sees its first request; one effect is created. |
+| `after_tool` | Tool returned success and the effect exists; engine completion is not committed. | Same request is sent again with the same key; tool deduplicates; one effect remains. |
+| `during_commit` | Tool effect exists; completion writes are inside an open DB transaction before COMMIT. | PostgreSQL rolls back the uncommitted checkpoint; step retries with the same key; one effect remains. |
+| `after_commit` | Step completion is durable; the next step has not started. | Completed step is skipped and execution resumes at the next step. |
+
+Run the same procedure for each stage:
+
+```text
+charge
+provision
+notify
+```
+
+Start from a clean stack, replacing `<STEP>` and `<POINT>` with one of the values above:
 
 ```sh
 docker compose down -v
 docker compose up --build -d --wait db tool api
 
-CHARGE_PAUSE_AT=after_tool \
-CHARGE_PAUSE_STEP=provision \
+CHARGE_PAUSE_STEP=<STEP> \
+CHARGE_PAUSE_AT=<POINT> \
 CHARGE_TOOL_FAILURE_RATE=0 \
 docker compose up --build -d worker
 ```
 
-Submit a run and copy the returned run ID:
+Submit a run and copy its ID:
 
 ```sh
 curl -s -X POST http://localhost:8000/runs \
@@ -216,7 +237,7 @@ curl -s -X POST http://localhost:8000/runs \
   -d '{"customer_id":"manual-crash-test","amount_cents":2500,"currency":"USD"}'
 ```
 
-Confirm the worker paused on `provision`:
+Confirm the worker reached the requested pause and inspect workflow/effect state:
 
 ```sh
 docker compose logs --no-color worker
@@ -224,14 +245,18 @@ curl -s http://localhost:8000/runs/<RUN_ID>
 curl -s "http://localhost:8001/effects?prefix=<RUN_ID>"
 ```
 
-Expected pre-crash state:
+For the selected `<STEP>`, earlier stages should already be `completed` and later stages should
+still be `pending`. The selected stage should be `running` at `before_tool`, `after_tool`,
+and `during_commit`, and `completed` at `after_commit`.
 
-- `charge` is `completed`
-- `provision` is `running`
-- `notify` is `pending`
-- the tool ledger already contains one charge effect and one provision effect
+The effect ledger differs by pause point:
 
-Kill the worker with SIGKILL, then restart it without the pause:
+- `before_tool`: no effect yet for the selected stage
+- `after_tool`: one effect already exists for the selected stage
+- `during_commit`: one effect already exists for the selected stage
+- `after_commit`: one effect exists and the stage checkpoint is already durable
+
+Kill the worker and restart without any pause:
 
 ```sh
 docker compose kill -s SIGKILL worker
@@ -241,21 +266,25 @@ CHARGE_TOOL_FAILURE_RATE=0 \
 docker compose up -d --force-recreate worker
 ```
 
-Inspect the same run again:
+Inspect the same run and ledger again:
 
 ```sh
 curl -s http://localhost:8000/runs/<RUN_ID>
 curl -s "http://localhost:8001/effects?prefix=<RUN_ID>"
 ```
 
-Expected final state:
+Expected final behavior for every stage:
 
-- the run and all three steps are `completed`
-- attempts are `charge=1`, `provision=2`, `notify=1`
-- the ledger contains exactly one charge, one provision, and one notify effect
+- the run finishes `completed`
+- exactly one effect exists for each of `charge`, `provision`, and `notify`
+- at `before_tool`, `after_tool`, and `during_commit`, the selected stage has `attempts=2`
+- at `after_commit`, the selected stage stays at `attempts=1` because completed work is not replayed
 
-This demonstrates the key guarantee: `provision` may be attempted twice after a crash, but the
-durable external effect is created only once because the same idempotency key is reused.
+For `before_tool`, the selected stage has two engine attempts but only one tool request. For
+`after_tool` and `during_commit`, the tool may receive the selected request twice, but the same
+idempotency key keeps the durable side effect at exactly one. For `after_commit`, the worker
+resumes at the next stage.
+
 
 ## Tests and development
 
@@ -270,8 +299,9 @@ terminal errors, sticky uncertainty, API validation, and second-worker rejection
 
 The commit barrier is inside an open transaction **before COMMIT**; it tests rollback, not disk
 tears or a precise interruption inside PostgreSQL's commit implementation. Exhaustion tests use
-a one-failure budget. The separate `test/retry-exhaustion-restart` regression is not yet in this
-branch; default-budget boundaries and both terminal states across restart remain follow-ups.
+a one-failure budget, including a restart regression that verifies a terminal failed run is not
+revived when the worker restarts against a healthy tool. Default-budget boundaries and
+`needs_review` across restart remain follow-ups.
 CI also builds images and runs the crash demo.
 
 For local development:
