@@ -55,6 +55,14 @@ FROM engine.steps
 ORDER BY run_id, position;
 
 SELECT * FROM mock_tool.effects;
+
+-- Verify that each run produced at most one durable charge effect.
+SELECT
+    split_part(idempotency_key, ':', 1) AS run_id,
+    COUNT(*) AS charge_count
+FROM mock_tool.effects
+WHERE operation = 'charge'
+GROUP BY 1;
 ```
 
 Each run has its own charge/provision/notify rows; repeated step names across different
