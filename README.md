@@ -58,8 +58,8 @@ For a manual video: start with
 `CHARGE_PAUSE_AT=after_tool CHARGE_TOOL_FAILURE_RATE=0 docker compose up --build -d --wait`,
 submit a run, inspect the ledger and worker logs, then execute
 `docker compose kill -s SIGKILL worker` followed by `docker compose start worker`.
-See [DEMO.md](DEMO.md) for a short recording outline. A narrated submission video still needs to
-be recorded by the candidate.
+See [DEMO.md](DEMO.md) for a short recording outline. The submission should include a candidate-narrated video demonstrating the crash and explaining
+one architectural decision.
 
 ## Tests and development
 
@@ -137,8 +137,11 @@ this process-crash failure model.
 - Other HTTP errors stop the run. A later step never starts after a failure.
 - Full-jitter exponential backoff has an 8-second ceiling. Valid `Retry-After` seconds or dates
   are a lower bound and may exceed that ceiling. The computed deadline and failure count persist.
-- Default budget: five recorded failures per step. A process crash increments attempts but not
-  the error budget; a `running` step is always allowed to resolve its unknown outcome on restart.
+- Default budget: five recorded failures per step (initial failure plus at most four retries
+  when each attempt returns a recorded error). `CHARGE_MAX_FAILURES` configures the application
+  setting; the current Compose file does not forward this variable from the host to the worker.
+  A recorded attempt interrupted by a process crash does not consume the failure budget; a
+  `running` step is allowed another attempt on restart to resolve its unknown outcome.
 - A timeout, interrupted attempt, invalid response, or 5xx may have produced an effect. That
   uncertainty is sticky until success: a subsequent 429 does not erase it. Exhaustion yields
   `needs_review`, not a false claim of no charge. No automatic refunds or operator retry endpoint.
@@ -148,6 +151,36 @@ effect. Failures are pseudorandom using a seed, key, and persisted request count
 `CHARGE_TOOL_FAIL_FIRST=1` to force one 429 per step. Completed keys return their saved result
 before failure injection. `CHARGE_TOOL_RESPONSE_DELAY_SECONDS` delays responses after commit,
 creating a genuine ambiguous-outcome window.
+
+## Feature expectations and terminal states
+
+The API returns `202 Accepted` when a run is saved, not when its work is complete. Poll
+`GET /runs/{id}` for current status; the original POST response does not update.
+
+| Step/run state | What the engine does automatically | What it does not do |
+|---|---|---|
+| `retry_wait` (step; run remains `running`) | Retries the same step once its persisted deadline is due, within the failure budget. | Does not restart earlier completed steps. |
+| `running` after worker death | After a replacement worker starts, retries the unfinished step with its original key and input. | Does not itself restart the worker process; Compose uses `restart: "no"`. |
+| `completed` | Skips completed steps; a completed run is no longer selected. | Does not repeat effects for that run. |
+| `failed` | Records a terminal failure when retrying stops without an unresolved outcome for the failing step. Later steps remain unstarted. | Does not revive the run when the tool becomes healthy or the worker restarts. |
+| `needs_review` | Records a terminal state when retrying stops with an unresolved outcome. Preserves error and attempt information for inspection. | Does not notify a person, open a ticket, publish a webhook, or start a reconciliation process. |
+
+**`needs_review` is a status, not an implemented human-review workflow.** Inspection currently
+requires querying the run API, logs, or database. There is no review queue, assignment, approval,
+operator resume endpoint, or automatic resolution. Uncertainty can be conservative: even a crash
+before sending a request can leave an unresolved `running` attempt.
+
+**There is one retry layer: bounded step retries.** There is no policy such as “the workflow
+reached FAILED; wait 30 minutes and revive the entire workflow automatically.” Both `failed`
+and `needs_review` remain terminal under the current scheduler, regardless of elapsed time,
+tool recovery, or worker restart. Increasing the failure budget does not reopen existing terminal
+runs. A step's retry deadline only applies while the run remains active.
+
+Failure does not roll back previous effects. For example, a successful charge followed by a
+terminal provision failure leaves the charge in place; there is no refund or compensation logic.
+Submitting the same input through `POST /runs` creates a new run with new keys and can charge
+again. Creating a new run is therefore not a safe substitute for reconciling and resuming the
+original one.
 
 ## Failure modes
 
@@ -159,8 +192,22 @@ creating a genuine ambiguous-outcome window.
 | Between checkpoint writes inside the transaction | Uncommitted completion changes | PostgreSQL rolls back; repeat safely. If COMMIT itself succeeded but its acknowledgement was lost, read the committed state and skip. |
 | After checkpoint commit, before the next step | Completed result is durable | Skip that step and proceed. Final-step/run completion are atomic. |
 
-The suite kills workers at each controlled boundary, tests concurrent duplicate tool requests,
-key conflicts, restart during retry waits, permanent failures, and uncertainty at retry exhaustion.
+Current automated coverage in `tests/test_recovery.py` and `tests/test_semantics.py`:
+
+| Scenario | Coverage |
+|---|---|
+| Before request, after response, inside checkpoint transaction, after checkpoint commit | Four boundaries × charge/provision/notify: 12 real SIGKILL cases. Checks ordering, skipped completed steps, attempt/request counts, and one effect per operation. |
+| Tool committed, response not yet received | Three cases, one per step, using a response delay and a real worker kill. |
+| Restart during retry wait | Charge; verifies the effect is not created before the saved deadline and the run finishes. |
+| Duplicate tool requests and mismatched key reuse | Concurrent requests converge on one effect; changed input or operation is rejected. |
+| Permanent errors and exhausted retries | Checks terminal states and blocked later steps; exhaustion tests use a one-failure budget. |
+| Unknown outcome followed by 429 | Verifies the later rejection does not erase earlier uncertainty. |
+| API and worker ownership | Validates run execution/input and rejection of a second worker. |
+
+This is targeted failure coverage, not an exhaustive proof of every possible crash timing.
+A separate exhausted-run restart test exists on `test/retry-exhaustion-restart`; it is not yet
+part of this branch's suite. Default five-failure budget boundaries and restart behavior for
+both terminal states are useful remaining regression tests.
 The `during_commit` barrier is **inside the open transaction before COMMIT**, not a simulated
 disk tear or a precise kill inside PostgreSQL's COMMIT implementation. PostgreSQL provides the
 atomicity of the actual commit; the test demonstrates rollback of uncommitted application writes.
@@ -187,6 +234,22 @@ Two choices I would revisit in production:
 classification; `tool_storage.py` owns mock deduplication; API modules validate and route requests.
 The mock deliberately receives the same purchase input for each step; this is an ordered execution
 example, not a general-purpose result-binding language or a real payment integration.
+
+## Next steps, in priority order
+
+These are proposed follow-ups, not features included in this take-home.
+
+| Priority | Work | Why it comes next |
+|---|---|---|
+| 1 — Finish submission validation | Integrate the exhausted-run restart regression; test the default budget around four versus five failures and terminal `needs_review` across restart. Confirm CI and record/link the narrated demo. | Closes specific coverage and delivery gaps without expanding runtime scope. |
+| 2 — Reconcile unresolved outcomes | Add provider lookup by the original operation key, a durable review queue, and reliable alerts. Surface the run, step, error, and original result when known. | A saved `needs_review` state alone can leave real customer work stranded and an external effect unresolved. |
+| 3 — Controlled operator recovery | Add authenticated, authorized, audited resolution/resume actions. Preserve original keys, immutable inputs, and completed checkpoints; guard concurrent operator actions. Define compensation for partial success. | Allows recovery without duplicate charges or blindly replaying completed work. |
+| 4 — Prevent duplicate submissions and expose operational health | Add client submission idempotency, durable event history, and metrics for retry volume, stuck runs, and unresolved outcomes. | Separate POST requests currently create separate purchases; operators also need to detect failures beyond terminal logs. |
+| 5 — Selective delayed recovery | Only after reconciliation and controlled resume exist, consider a durable schedule for verified transient failures, with cooldowns and a total recovery budget. | Helps with long outages. It must resume eligible unfinished work safely, never blindly revive all terminal runs or unresolved effects. |
+| 6 — Scale and broaden execution | Introduce per-run claims/leases, stale-worker fencing, bounded concurrency, graceful drain, and tool-wide throttling. Add fan-out/cancellation only for demonstrated product needs. | Throughput and richer workflows add ownership and side-effect complexity; establish recovery semantics first. |
+
+For deployment beyond the local demo, authentication, secret management, database migrations,
+backups, and service supervision are prerequisites rather than capabilities provided by Compose.
 
 ## AI usage
 
