@@ -1,0 +1,77 @@
+x-app: &app
+  build: .
+  environment: &env
+    CHARGE_DATABASE_URL: postgresql://charge:charge@db:5432/charge
+  depends_on:
+    db:
+      condition: service_healthy
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: charge
+      POSTGRES_PASSWORD: charge
+      POSTGRES_DB: charge
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./scripts/create-test-db.sql:/docker-entrypoint-initdb.d/02-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U charge -d charge"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  api:
+    <<: *app
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  tool:
+    <<: *app
+    command: ["uvicorn", "charge_agent.mock_api:app", "--host", "0.0.0.0", "--port", "8001"]
+    ports:
+      - "127.0.0.1:8001:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    environment:
+      <<: *env
+      CHARGE_TOOL_FAILURE_RATE: ${CHARGE_TOOL_FAILURE_RATE:-0.25}
+      CHARGE_TOOL_FAIL_FIRST: ${CHARGE_TOOL_FAIL_FIRST:-0}
+      CHARGE_TOOL_RESPONSE_DELAY_SECONDS: ${CHARGE_TOOL_RESPONSE_DELAY_SECONDS:-0}
+  worker:
+    <<: *app
+    command: ["python", "-m", "charge_agent.worker"]
+    environment:
+      <<: *env
+      CHARGE_TOOL_URL: http://tool:8001
+      CHARGE_PAUSE_AT: ${CHARGE_PAUSE_AT:-}
+    depends_on:
+      db:
+        condition: service_healthy
+      tool:
+        condition: service_healthy
+    # Explicit restart in the demo makes crash/recovery visible.
+    restart: "no"
+  seed:
+    <<: *app
+    profiles: ["seed"]
+    command: ["python", "scripts/seed.py"]
+  test:
+    <<: *app
+    profiles: ["test"]
+    command: ["pytest", "-q", "-p", "no:cacheprovider"]
+    environment:
+      CHARGE_TEST_DATABASE_URL: postgresql://charge:charge@db:5432/charge_test
+
+volumes:
+  pgdata:
