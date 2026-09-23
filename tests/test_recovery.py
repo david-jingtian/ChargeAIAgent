@@ -1,4 +1,5 @@
 import signal
+import time
 from uuid import UUID
 
 import httpx
@@ -177,8 +178,6 @@ def test_retry_exhaustion_stays_terminal_after_restart(
     wait_until(lambda: "worker_ready" in log.read_text())
 
     # Give the restarted worker several poll cycles to prove it does not select terminal work.
-    import time
-
     time.sleep(0.2)
     assert restarted.poll() is None
 
