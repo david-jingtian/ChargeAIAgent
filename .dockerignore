@@ -7,3 +7,6 @@ __pycache__
 .ruff_cache
 .env
 *.log
+.idea
+.DS_Store
+Thumbs.db
