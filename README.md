@@ -32,7 +32,7 @@ Run with no other unfinished workflows. Restore normal settings afterward:
 docker compose up -d --force-recreate tool worker
 ```
 
-See [DEMO.md](DEMO.md) for the recording outline; include a narrated video in the submission.
+See [DEMO.md](DEMO.md) for a narrated walkthrough outline.
 PostgreSQL data lives in a named volume: `docker compose down` preserves it;
 **`docker compose down -v` deletes it**. Services use local-demo credentials and no API
 authentication; this is not a production deployment.
@@ -333,8 +333,8 @@ operator tooling we have not built**.
 
 Priority order:
 
-1. **Finish validation:** integrate the terminal-restart regression, test the default failure
-   budget and `needs_review` across restart, confirm CI, and record the demo.
+1. **Finish validation:** test the default failure budget and `needs_review` across restart,
+   confirm CI, and keep the demo recording current.
 2. **Resolve stranded runs:** provider lookup by original key, review queue, and reliable alerts.
 3. **Enable safe recovery:** authorized, audited resume preserving keys/checkpoints; define
    compensation for partial success.
@@ -351,4 +351,4 @@ AI helped with scoping, implementation, tests, and review. An early plan treated
 as ordinary failure; reviewing a committed charge with a lost response exposed the mistake.
 The engine now preserves uncertainty as `needs_review`, with a regression for a subsequent 429.
 Review also caught the need to wait for tool health at startup. Generated tests are not evidence
-until run; the candidate should understand the transaction boundaries and provider contract.
+until run; the transaction boundaries and provider contract should be understood and reviewed.
