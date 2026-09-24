@@ -1,4 +1,4 @@
-# Suggested 3–5 minute recording
+# Demo recording guide
 
 1. Explain scope: sequential purchase workflow, one worker, PostgreSQL, crash resume + retries.
 2. Run `python3 scripts/demo.py`. It performs a real SIGKILL and asserts the result. For a slower
@@ -15,5 +15,5 @@
 
 For a second quick demonstration, disable the pause and set `CHARGE_TOOL_FAIL_FIRST=1`, recreate
 tool/worker, and submit a fresh run. Inspect attempts/failures and the worker's persisted wait logs.
-Review the CI test output before recording. Record your own narration and add the video link to
-the submission; the script is a reproducible demo, not a replacement for the requested video.
+Review the CI test output before recording. Add the narrated video link to the README or the
+relevant pull request; the script is a reproducible demo, not a replacement for a walkthrough.
